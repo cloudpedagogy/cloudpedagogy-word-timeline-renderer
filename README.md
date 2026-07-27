@@ -11,9 +11,13 @@ Convert structured tables in an editable Microsoft Word document into a standalo
 - [Example QA report](output/timeline_example/qa_report.md)
 - [Automated tests](tests/test_render_timeline.py)
 
-GitHub cannot run an interactive HTML file from its normal file preview. After enabling GitHub Pages, the live demonstration will be:
+## Live Demo
 
-https://cloudpedagogy.github.io/cloudpedagogy-word-timeline-renderer/output/timeline_example/
+[View the Word Timeline Renderer demo](http://cloudpedagogy-word-timeline-renderer.s3-website.eu-west-2.amazonaws.com/)
+
+## Screenshot
+
+[![Word Timeline Renderer screenshot](img/screenshot.png)](http://cloudpedagogy-word-timeline-renderer.s3-website.eu-west-2.amazonaws.com/)
 
 ## Quick start
 
