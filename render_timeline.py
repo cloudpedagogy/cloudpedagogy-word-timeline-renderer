@@ -22,7 +22,7 @@ EVENT_ALIASES = {
     "id": {"id", "event id", "event_id"},
     "start": {"start", "date", "start date", "start_date", "when"},
     "end": {"end", "end date", "end_date", "finish", "finish date"},
-    "title": {"title", "event", "label", "name"},
+    "title": {"title", "event", "label", "name", "event title", "event name"},
     "description": {"description", "details", "summary", "notes"},
     "category": {"category", "type", "theme"},
     "group": {"group", "track", "lane", "stream"},
@@ -104,6 +104,41 @@ def parse_date(raw: str) -> str | None:
         return None
 
 
+def parse_iso_datetime(value: str) -> tuple[datetime, bool]:
+    """Parse an ISO date or datetime string into a datetime object.
+
+    Returns (dt, is_date_only).
+    """
+    v = value.strip()
+    if len(v) == 10 and "T" not in v and " " not in v:
+        d = date.fromisoformat(v)
+        return datetime(d.year, d.month, d.day), True
+    dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    return dt, False
+
+
+def is_end_before_start(start_iso: str, end_iso: str) -> bool:
+    """Chronologically test if end is strictly before start.
+
+    Applies calendar-day semantics for date-only end values.
+    """
+    try:
+        start_dt, start_is_date = parse_iso_datetime(start_iso)
+        end_dt, end_is_date = parse_iso_datetime(end_iso)
+    except (ValueError, TypeError):
+        return end_iso < start_iso
+
+    if end_is_date or start_is_date:
+        start_date = start_dt.date()
+        end_date = end_dt.date()
+        return end_date < start_date
+
+    if (start_dt.tzinfo is None) == (end_dt.tzinfo is None):
+        return end_dt < start_dt
+
+    return end_dt.replace(tzinfo=None) < start_dt.replace(tzinfo=None)
+
+
 def valid_color(value: str) -> bool:
     return bool(
         re.fullmatch(r"#[0-9a-fA-F]{3,8}", value)
@@ -122,18 +157,34 @@ def table_rows(table) -> list[list[str]]:
 
 
 def detect_table_type(rows: list[list[str]], preceding_heading: str) -> str | None:
+    if not rows:
+        heading = normalise(preceding_heading)
+        if heading in {"events", "timeline events", "event data"}:
+            return "events"
+        if heading in {"settings", "timeline settings", "configuration"}:
+            return "settings"
+        return None
+
+    headers = {normalise(x) for x in rows[0]}
+    has_event_headers = bool(headers & EVENT_ALIASES["start"] and headers & EVENT_ALIASES["title"])
+    has_setting_headers = bool(
+        any(k in headers for k in {"setting", "key", "option", "name"})
+        and any(v in headers for v in {"value", "setting value"})
+    )
+
+    if has_event_headers and not has_setting_headers:
+        return "events"
+    if has_setting_headers and not has_event_headers:
+        return "settings"
+
     heading = normalise(preceding_heading)
     if heading in {"events", "timeline events", "event data"}:
-        return "events"
+        if not has_setting_headers:
+            return "events"
     if heading in {"settings", "timeline settings", "configuration"}:
-        return "settings"
-    if not rows:
-        return None
-    headers = {normalise(x) for x in rows[0]}
-    if headers & EVENT_ALIASES["start"] and headers & EVENT_ALIASES["title"]:
-        return "events"
-    if {"setting", "value"} <= headers or {"key", "value"} <= headers:
-        return "settings"
+        if not has_event_headers:
+            return "settings"
+
     return None
 
 
@@ -152,7 +203,7 @@ def iter_blocks(document):
 def read_docx(path: Path) -> ParseResult:
     result = ParseResult()
     document = Document(path)
-    heading = ""
+    active_heading = ""
     event_tables = 0
 
     from docx.table import Table
@@ -160,20 +211,93 @@ def read_docx(path: Path) -> ParseResult:
     for block in iter_blocks(document):
         if isinstance(block, Table):
             rows = table_rows(block)
-            kind = detect_table_type(rows, heading)
+            kind = detect_table_type(rows, active_heading)
             if kind == "settings":
                 parse_settings(rows, result)
             elif kind == "events":
                 event_tables += 1
                 parse_events(rows, result)
+            active_heading = ""
         elif block.text.strip():
-            heading = block.text.strip()
+            text = block.text.strip()
+            norm = normalise(text)
+            if norm in {"events", "timeline events", "event data"}:
+                active_heading = "events"
+            elif norm in {"settings", "timeline settings", "configuration"}:
+                active_heading = "settings"
+            elif getattr(block, "style", None) and getattr(block.style, "name", "").startswith("Heading"):
+                active_heading = text
+            elif not active_heading:
+                active_heading = text
 
     if event_tables == 0:
         result.issues.append(Issue("error", "No EVENTS table found. Add a table with start/date and title columns."))
     if not result.events:
         result.issues.append(Issue("error", "No valid events were found."))
     return result
+
+
+def validate_settings(result: ParseResult) -> None:
+    settings = result.settings
+    existing = {x.message for x in result.issues}
+
+    if "height" in settings:
+        h = settings["height"]
+        if not re.fullmatch(r"\d+(px|vh|rem|em|%)", h):
+            msg = f"Invalid height '{h}'; using 620px."
+            if msg not in existing:
+                result.issues.append(Issue("warning", msg))
+                existing.add(msg)
+
+    if "orientation" in settings:
+        o = normalise(settings["orientation"])
+        if o not in {"top", "bottom", "both", "none"}:
+            msg = f"Invalid orientation '{o}'; using bottom."
+            if msg not in existing:
+                result.issues.append(Issue("warning", msg))
+                existing.add(msg)
+
+    val_min = None
+    if "zoom_min_days" in settings:
+        raw_min = settings["zoom_min_days"]
+        try:
+            val = float(raw_min)
+            if val <= 0:
+                msg = f"Invalid zoom min days '{raw_min}'; must be positive."
+                if msg not in existing:
+                    result.issues.append(Issue("warning", msg))
+                    existing.add(msg)
+            else:
+                val_min = val
+        except ValueError:
+            msg = f"Invalid zoom min days '{raw_min}'; expected a number."
+            if msg not in existing:
+                result.issues.append(Issue("warning", msg))
+                existing.add(msg)
+
+    val_max = None
+    if "zoom_max_days" in settings:
+        raw_max = settings["zoom_max_days"]
+        try:
+            val = float(raw_max)
+            if val <= 0:
+                msg = f"Invalid zoom max days '{raw_max}'; must be positive."
+                if msg not in existing:
+                    result.issues.append(Issue("warning", msg))
+                    existing.add(msg)
+            else:
+                val_max = val
+        except ValueError:
+            msg = f"Invalid zoom max days '{raw_max}'; expected a number."
+            if msg not in existing:
+                result.issues.append(Issue("warning", msg))
+                existing.add(msg)
+
+    if val_min is not None and val_max is not None and val_min > val_max:
+        msg = "zoom_min_days cannot exceed zoom_max_days; using defaults."
+        if msg not in existing:
+            result.issues.append(Issue("warning", msg))
+            existing.add(msg)
 
 
 def parse_settings(rows: list[list[str]], result: ParseResult) -> None:
@@ -197,6 +321,7 @@ def parse_settings(rows: list[list[str]], result: ParseResult) -> None:
             result.settings[key] = value
         else:
             result.issues.append(Issue("warning", f"Unknown setting '{row[key_i]}' ignored.", row_num))
+    validate_settings(result)
 
 
 def parse_events(rows: list[list[str]], result: ParseResult) -> None:
@@ -236,16 +361,23 @@ def parse_events(rows: list[list[str]], result: ParseResult) -> None:
         end = parse_date(record.get("end", ""))
         if record.get("end") and not end:
             result.issues.append(Issue("warning", f"Invalid end date '{record['end']}'; event treated as a point.", row_num))
-        if end and end < start:
+        if end and is_end_before_start(start, end):
             result.issues.append(Issue("error", "End date is before start date. Row skipped.", row_num))
             continue
-        event_id = record.get("id") or f"event-{len(result.events) + 1}"
-        base_id, suffix = event_id, 2
-        while event_id in existing_ids:
-            event_id = f"{base_id}-{suffix}"
-            suffix += 1
-        if event_id != base_id:
-            result.issues.append(Issue("warning", f"Duplicate id '{base_id}' renamed to '{event_id}'.", row_num))
+        explicit_id = record.get("id", "").strip()
+        if explicit_id:
+            event_id = explicit_id
+            base_id, suffix = event_id, 2
+            while event_id in existing_ids:
+                event_id = f"{base_id}-{suffix}"
+                suffix += 1
+            if event_id != base_id:
+                result.issues.append(Issue("warning", f"Duplicate id '{base_id}' renamed to '{event_id}'.", row_num))
+        else:
+            gen_num = 1
+            while f"event-{gen_num}" in existing_ids:
+                gen_num += 1
+            event_id = f"event-{gen_num}"
         existing_ids.add(event_id)
 
         color = record.get("color", "")
@@ -280,22 +412,30 @@ def get_asset(project: Path, filename: str) -> str:
 
 
 def build_html(result: ParseResult, project: Path, use_cdn: bool) -> str:
+    validate_settings(result)
     settings = result.settings
     title = settings.get("title") or "Interactive Timeline"
     subtitle = settings.get("subtitle", "")
     height = settings.get("height", "620px")
     if not re.fullmatch(r"\d+(px|vh|rem|em|%)", height):
-        result.issues.append(Issue("warning", f"Invalid height '{height}'; using 620px."))
         height = "620px"
     orientation = normalise(settings.get("orientation", "bottom"))
     if orientation not in {"top", "bottom", "both", "none"}:
-        result.issues.append(Issue("warning", f"Invalid orientation '{orientation}'; using bottom."))
         orientation = "bottom"
     stack = parse_bool(settings.get("stack", ""), True, result, "stack")
 
     categories = sorted({x["category"] for x in result.events if x["category"]})
     groups = sorted({x["group"] for x in result.events if x["group"]})
     group_ids = {name: index + 1 for index, name in enumerate(groups)}
+    has_ungrouped = any(not x["group"] for x in result.events)
+    if groups and has_ungrouped:
+        fallback_name = "General" if "General" not in groups else "(Ungrouped)"
+        groups.append(fallback_name)
+        group_ids[fallback_name] = len(groups)
+        fallback_id = group_ids[fallback_name]
+    else:
+        fallback_id = None
+
     items = []
     for event in result.events:
         detail = f"<strong>{html.escape(event['title'])}</strong>"
@@ -314,9 +454,40 @@ def build_html(result: ParseResult, project: Path, use_cdn: bool) -> str:
             item["end"] = event["end"]
         if event["group"]:
             item["group"] = group_ids[event["group"]]
+        elif fallback_id is not None:
+            item["group"] = fallback_id
         if event["color"]:
             item["style"] = f"background-color:{event['color']};border-color:{event['color']}"
         items.append(item)
+
+    zoom_min_ms = 86400000
+    zoom_max_ms = 315576000000
+
+    val_min = None
+    if "zoom_min_days" in settings:
+        try:
+            val = float(settings["zoom_min_days"])
+            if val > 0:
+                val_min = val
+        except ValueError:
+            pass
+
+    val_max = None
+    if "zoom_max_days" in settings:
+        try:
+            val = float(settings["zoom_max_days"])
+            if val > 0:
+                val_max = val
+        except ValueError:
+            pass
+
+    if val_min is not None and val_max is not None and val_min <= val_max:
+        zoom_min_ms = int(val_min * 86400000)
+        zoom_max_ms = int(val_max * 86400000)
+    elif val_min is not None and val_max is None:
+        zoom_min_ms = int(val_min * 86400000)
+    elif val_max is not None and val_min is None:
+        zoom_max_ms = int(val_max * 86400000)
 
     if use_cdn:
         assets = (
@@ -364,8 +535,8 @@ button{{cursor:pointer}} button:hover{{border-color:var(--accent)}} #timeline{{h
 const allItems={data_json}, groupData={groups_json}, categories={categories_json};
 const dataSet=new vis.DataSet(allItems), groups=new vis.DataSet(groupData);
 const timeline=new vis.Timeline(document.getElementById('timeline'),dataSet,groupData.length?groups:null,{{
-  stack:{str(stack).lower()},orientation:{json.dumps(orientation)},zoomMin:86400000,
-  zoomMax:315576000000,multiselect:false,tooltip:{{followMouse:true,overflowMethod:'cap'}}
+  stack:{str(stack).lower()},orientation:{json.dumps(orientation)},zoomMin:{zoom_min_ms},
+  zoomMax:{zoom_max_ms},multiselect:false,tooltip:{{followMouse:true,overflowMethod:'cap'}}
 }});
 const search=document.getElementById('search'), category=document.getElementById('category'), summary=document.getElementById('summary');
 categories.forEach(x=>{{const o=document.createElement('option');o.value=x;o.textContent=x;category.appendChild(o)}});
